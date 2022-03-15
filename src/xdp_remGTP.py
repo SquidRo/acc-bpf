@@ -127,7 +127,22 @@ static inline int get_udp_hdr_len(
     return sizeof(*udph);
 }
 
-// retutn len of vxlan header or -1 if failed
+// dst port (in network order)
+// retutn len of tcp header or -1 if failed
+static inline int get_tcp_hdr_len(
+    void *data, void *data_end, uint32_t cur_ofs, uint16_t *dst_port)
+{
+    struct tcphdr *tcph = data + cur_ofs;
+
+    if ((void *)&tcph[1] > data_end)
+        return -1;
+
+    *dst_port = tcph->dest;
+
+    return tcph->doff * 4;
+}
+
+// retutn len of gtp1u header or -1 if failed
 static inline int get_gtp1u_hdr_len(
     void *data, void *data_end, uint32_t cur_ofs)
 {
@@ -150,17 +165,31 @@ static inline int get_gtp1u_hdr_len(
     return hdr_len;
 }
 
+// return 1 if ipv4 header exists at the specified offset
+static inline int is_ip4_hdr(
+    void *data, void *data_end, uint32_t cur_ofs)
+{
+    struct iphdr *iph = data + cur_ofs;
+
+    if ((void *)&iph[1] > data_end)
+        return -1;
+
+    return (iph->version == 4);
+}
+
 int xdp_remGTP(struct CTXTYPE *ctx)
 {
     void        *data_end = (void*)(long)ctx->data_end;
     void        *data = (void*)(long)ctx->data;
     uint64_t    *rem_c;
     uint32_t    cur_ofs =0;
-    uint16_t    next_proto;
     int         hdr_len;
-                // for eth/vlan/ip/udp/gprs/
-                //       0/   1/ 2/  3/   4/
+                // for eth/vlan/ip/udp or tcp/gprs/
+                //       0/   1/ 2/         3/   4/
     int         hdr_len_rec[5] = {0};
+    int         is_outer_ip4 = 0;
+    int         is_inner_ip4 = 0;
+    uint16_t    next_proto;
 
     hdr_len = get_eth_hdr_len(data, data_end, cur_ofs, &next_proto);
     if (hdr_len > 0)
@@ -198,6 +227,7 @@ int xdp_remGTP(struct CTXTYPE *ctx)
             bpf_trace_printk("ip ofs - %d" DBG_LR, cur_ofs);
 #endif
 
+            is_outer_ip4 = 1;
             break;
 
         case htons(ETH_P_IPV6):
@@ -208,6 +238,7 @@ int xdp_remGTP(struct CTXTYPE *ctx)
                 return XDP_PASS;
 
             cur_ofs += hdr_len;
+            hdr_len_rec[2] = hdr_len;
 
 #ifdef ENABLE_DBG
             bpf_trace_printk("ip6 ofs - %d" DBG_LR, cur_ofs);
@@ -219,13 +250,9 @@ int xdp_remGTP(struct CTXTYPE *ctx)
             return XDP_PASS;
         }
 
-        if (next_proto == IPPROTO_UDP)
+        switch (next_proto)
         {
-#ifdef ENABLE_DBG // make verifier happy
-            data_end = (void*)(long)ctx->data_end;
-            data = (void*)(long)ctx->data;
-#endif
-
+        case IPPROTO_UDP:
             hdr_len = get_udp_hdr_len(data, data_end, cur_ofs, &next_proto);
 
             if (hdr_len < 0)
@@ -237,46 +264,95 @@ int xdp_remGTP(struct CTXTYPE *ctx)
 #ifdef ENABLE_DBG
             bpf_trace_printk("udp ofs - %d" DBG_LR, cur_ofs);
 #endif
-            if (next_proto == htons(GTP1U_PORT))
-            {
-                int cut_len, l2_hdr_len;
-                char *src, *dst;
+            break;
+        case IPPROTO_TCP:
+            hdr_len = get_tcp_hdr_len(data, data_end, cur_ofs, &next_proto);
 
-                hdr_len = get_gtp1u_hdr_len(data, data_end, cur_ofs);
+            if (hdr_len < 0)
+                return XDP_PASS;
 
-                if (hdr_len < 0)
-                    return XDP_PASS;
-
-                cur_ofs += hdr_len;
+            cur_ofs += hdr_len;
+            hdr_len_rec[3] = hdr_len;
 
 #ifdef ENABLE_DBG
-                bpf_trace_printk("gtp1u ofs - %d" DBG_LR, cur_ofs);
+            bpf_trace_printk("tcp ofs - %d" DBG_LR, cur_ofs);
+#endif
+            break;
+        default:
+            return XDP_PASS;
+        }
+
+        if (next_proto == htons(GTP1U_PORT))
+        {
+            int cut_len, l2_hdr_len;
+
+            hdr_len = get_gtp1u_hdr_len(data, data_end, cur_ofs);
+
+            if (hdr_len < 0)
+                return XDP_PASS;
+
+            cur_ofs += hdr_len;
+
+#ifdef ENABLE_DBG
+            bpf_trace_printk("gtp1u ofs - %d" DBG_LR, cur_ofs);
 #endif
 
-                hdr_len_rec[4] = hdr_len;
+            hdr_len_rec[4] = hdr_len;
 
-                // need to cut inserted (ip/udp/gprs) part
-                cut_len    = hdr_len_rec[2] + hdr_len_rec[3] + hdr_len_rec[4];
-                l2_hdr_len = hdr_len_rec[0] + hdr_len_rec[1];
+            is_inner_ip4 = is_ip4_hdr(data, data_end, cur_ofs);
 
-                // move eth + vlan headear forward to strip the gtp tunnel header
-                for (int i=0; i<l2_hdr_len; i++)
-                {
-                    src = data + i;
-                    if (&src[1] > data_end)
-                        return XDP_PASS;
+            // need to cut inserted (ip/udp or tcp /gprs) part
+            //    cut_len max: 60 + 60 + 12
+            // l2_hdr_len max: 14 + 8
+            cut_len    = hdr_len_rec[2] + hdr_len_rec[3] + hdr_len_rec[4];
+            l2_hdr_len = hdr_len_rec[0] + hdr_len_rec[1];
 
-                    dst = data + i + cut_len;
-                    if (&dst[1] > data_end)
-                        return XDP_PASS;
-
-                    *dst = *src;
-                }
-
-                bpf_xdp_adjust_head(ctx, cut_len);
-
-                update_rem_total();
+            if (is_inner_ip4 != is_outer_ip4)
+            {
+                // need to modify the ethertype
+                l2_hdr_len -= 2;
             }
+
+            // move eth + vlan headear forward to strip the gtp tunnel header
+            for (int i=0; i<l2_hdr_len; i++)
+            {
+                char *src, *dst;
+
+                src = data + i;
+                if (&src[1] > data_end)
+                    return XDP_PASS;
+
+                dst = data + i + (cut_len & 0xff); // make verifier happy
+                if (&dst[1] > data_end)
+                    return XDP_PASS;
+
+                *dst = *src;
+            }
+
+            if (is_inner_ip4 != is_outer_ip4)
+            {
+                char *dst;
+
+                // need to modify the ethertype
+                dst = data + (l2_hdr_len & 0xff) + (cut_len & 0xff); // make verifier happy
+                if (&dst[2] > data_end)
+                    return XDP_PASS;
+
+                if (!is_inner_ip4)
+                {
+                    dst[0] = 0x86;
+                    dst[1] = 0xdd;
+                }
+                else
+                {
+                   dst[0] = 0x08;
+                   dst[1] = 0x00;
+                }
+            }
+
+            bpf_xdp_adjust_head(ctx, cut_len);
+
+            update_rem_total();
         }
     }
 
