@@ -40,10 +40,9 @@ static inline void update_rem_total(void)
 static inline int get_eth_hdr_len(
     void *data, void *data_end, u32 cur_ofs, uint16_t *next_proto)
 {
-    struct ethhdr   *eth = data;
+    struct ethhdr   *eth = data + cur_ofs;
     int             len  = sizeof(*eth);
 
-    eth = data + cur_ofs;
     if ((void *)&eth[1] > data_end)
         return -1;
 
@@ -134,12 +133,15 @@ static inline int get_tcp_hdr_len(
 {
     struct tcphdr *tcph = data + cur_ofs;
 
-    if ((void *)&tcph[1] > data_end)
+    if ((void *)&tcph->dest> data_end) // make verifier happy
         return -1;
 
     *dst_port = tcph->dest;
 
-    return tcph->doff * 4;
+    if ((void *)&tcph[1]> data_end)
+        return -1;
+
+    return tcph->doff << 2;
 }
 
 // retutn len of gtp1u header or -1 if failed
@@ -265,6 +267,7 @@ int xdp_remGTP(struct CTXTYPE *ctx)
             bpf_trace_printk("udp ofs - %d" DBG_LR, cur_ofs);
 #endif
             break;
+
         case IPPROTO_TCP:
             hdr_len = get_tcp_hdr_len(data, data_end, cur_ofs, &next_proto);
 
@@ -278,6 +281,7 @@ int xdp_remGTP(struct CTXTYPE *ctx)
             bpf_trace_printk("tcp ofs - %d" DBG_LR, cur_ofs);
 #endif
             break;
+
         default:
             return XDP_PASS;
         }
