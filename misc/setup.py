@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, subprocess
+import os, subprocess, glob
 from setuptools import setup, find_packages
 
 here = os.path.dirname(os.path.realpath(__file__))
@@ -24,10 +24,7 @@ setup(
     license='Apache 2.0',
     author='',
     author_email='',
-    scripts=['bin/xdp_deDup.py',
-             'bin/xdp_remVxlan.py',
-             'bin/xdp_cutPacket.py'
-    ],
+    scripts=glob.glob("bin/*.py"),
     maintainer='',
     maintainer_email='',
     classifiers=[
