@@ -21,8 +21,7 @@ BPF_HASH(sip_filter, u32, u32, HT_MAX);
 BPF_ARRAY(mod_total, uint64_t, 1);
 BPF_ARRAY(en_sip_filter, u32, 1);
 
-static inline int is_en_sip_filter(void)
-{
+static inline int is_en_sip_filter(void) {
     uint32_t *en_flag;
 
     en_flag = en_sip_filter.lookup((uint32_t []) {0});
@@ -192,9 +191,12 @@ class PinnedTable(table.HashTable):
         self.Leaf = leaftype
         self.max_entries = max_entries
 
-def set_filter_hosts(kpath, add_lst, del_lst):
+def set_filter_hosts(kpath, in_sip_tbl, add_lst, del_lst):
     try:
-        sip_tbl = PinnedTable(kpath, ctypes.c_uint32, ctypes.c_uint32, max_filter_sips)
+        if kpath != None:
+            sip_tbl = PinnedTable(kpath, ctypes.c_uint32, ctypes.c_uint32, max_filter_sips)
+        else:
+            sip_tbl = in_sip_tbl
 
         if del_lst != None:
             for sip in del_lst:
@@ -235,15 +237,15 @@ parser.add_argument('dev', nargs ='?',
 args = parser.parse_args()
 
 if max_filter_sips > 0:
-    if args.HOSTS == None and args.NHOSTS == None and args.LIST == None:
-        if args.dev == None:
+    if args.dev == None:
+        if args.HOSTS == None and args.NHOSTS == None and args.LIST == None:
             print("error: the following arguments are required: dev")
             exit (1)
         else:
-            device = args.dev
+            set_filter_hosts(dbg_path, None, args.HOSTS, args.NHOSTS)
+            exit(0)
     else:
-        set_filter_hosts(dbg_path, args.HOSTS, args.NHOSTS)
-        exit(0)
+        device = args.dev
 
 if mode == BPF.XDP:
     ret = "XDP_DROP"
@@ -265,6 +267,8 @@ en_sip_filter[ctypes.c_uint32(0)] = ctypes.c_uint32(0)
 
 if max_filter_sips > 0:
     sip_filter = b.get_table("sip_filter")
+
+    set_filter_hosts(None, sip_filter, args.HOSTS, args.NHOSTS)
 
     try:
         if os.path.exists(dbg_path):

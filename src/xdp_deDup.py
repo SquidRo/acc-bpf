@@ -9,6 +9,12 @@ import pyroute2, time, sys, argparse, ctypes, os
 c_text = """
 #include <uapi/linux/bpf.h>
 
+enum op_idx {
+    OP_DBG,
+    OP_HLEN,
+    OP_MAX,
+};
+
 enum cb_idx {
     CB_P0,
     CB_P1,
@@ -18,6 +24,7 @@ enum cb_idx {
 };
 
 #define LOOP_MAX_ONE_ROUND      20
+#define DFLT_HASH_LEN           0xfff
 
 /* max packet len = 240 * 7 + 12 (done in CB_FIN) */
 const int LOOP_MAX_LEN = CB_FIN * LOOP_MAX_ONE_ROUND * 12;
@@ -30,23 +37,37 @@ struct meta_info {
     uint8_t     cur_step;
 } __attribute__((aligned(4)));
 
-BPF_ARRAY(dbg_opt, uint32_t, 1); // 0: off, 1: on
+BPF_ARRAY(opt_tbl, uint32_t, OP_MAX);
 BPF_PROG_ARRAY(parser, CB_MAX);
 BPF_HASH(packet_hash, u32, u32, HT_MAX);
 BPF_ARRAY(drop_total, uint64_t, 1);
 
-static inline int is_dbg_on_ex(void)
+// return -1 if failed
+static inline int get_opt(uint32_t op_idx)
 {
-    uint32_t *dbg_flag;
+    uint32_t *opt_val;
 
-    dbg_flag = dbg_opt.lookup((uint32_t []) {0});
+    opt_val = opt_tbl.lookup(&op_idx);
 
-    if (dbg_flag)
+    if (opt_val)
     {
-        return (*dbg_flag != 0);
+        return *opt_val;
     }
 
-    return 0;
+    return -1;
+}
+
+// return default value if failed
+static inline int get_opt_limit(void)
+{
+    int ret;
+
+    ret = get_opt(OP_HLEN);
+
+    if ((ret == -1) || (ret == 0))
+        ret = DFLT_HASH_LEN;
+
+    return ret;
 }
 
 static inline uint32_t
@@ -88,6 +109,7 @@ int cb_hash_fin(struct CTXTYPE *ctx)
     struct meta_info    *meta;
     uint32_t            tmp_3w[3] = {0};
     uint8_t             *src_p, *dst_p;
+    int                 limit;
 
     data_end = (void*)(long)ctx->data_end;
     data = (void*)(long)ctx->data;
@@ -96,6 +118,8 @@ int cb_hash_fin(struct CTXTYPE *ctx)
     meta = (void *)(unsigned long)ctx->data_meta;
     if ((void *)&meta[1] > data)
         return XDP_PASS;
+
+    limit = get_opt_limit();
 
     src_p = data + (meta->cur_ofs & 0xfff);
     dst_p = tmp_3w;
@@ -115,7 +139,7 @@ int cb_hash_fin(struct CTXTYPE *ctx)
 
     jhash_final(&meta->a, &meta->b, &meta->c);
 
-    if (is_dbg_on_ex())
+    if (get_opt(OP_DBG) > 0)
     {
         bpf_trace_printk("pf ofs  - %d" DBGLR, (void *)src_p - data);
         bpf_trace_printk("pf hash - %x" DBGLR, meta->c);
@@ -138,7 +162,7 @@ int cb_hash_p0(struct CTXTYPE *ctx)
                         tmp_3w[3] = {0};
     uint32_t            len;
     uint8_t             *src_p, *dst_p;
-    int                 ret, basis = 0;
+    int                 limit, ret, basis = 0;
 
     ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(*meta));
     if (ret < 0)
@@ -151,10 +175,17 @@ int cb_hash_p0(struct CTXTYPE *ctx)
 
     a = b = c = 0xdeadbeef + len + basis;
 
+    limit = get_opt_limit();
+
+    if (get_opt(OP_DBG) > 0)
+    {
+        bpf_trace_printk("p0 lim  - %d" DBGLR, limit);
+    }
+
     #pragma unroll
     for (int i =0; i <LOOP_MAX_ONE_ROUND; i++)
     {
-        if (cur_idx + 12 > len)
+        if ((cur_idx + 12 > len) || (cur_idx + 12 > limit))
             break;
 
         src_p = data + cur_idx;
@@ -188,18 +219,18 @@ int cb_hash_p0(struct CTXTYPE *ctx)
     meta->cur_ofs  = cur_idx;
     meta->cur_step = 0;
 
-    if (is_dbg_on_ex())
+    if (get_opt(OP_DBG) > 0)
     {
         bpf_trace_printk("p0 len  - %d" DBGLR, len);
         bpf_trace_printk("p0 ofs  - %d" DBGLR, cur_idx);
         bpf_trace_printk("p0 hash - %x" DBGLR, meta->c);
     }
 
-    if (len == cur_idx)
+    if ((len == cur_idx) || (cur_idx == limit))
     {
         parser.call(ctx, CB_MATCH);
     }
-    else if (len <= cur_idx + 12)
+    else if ((len <= cur_idx + 12) || (limit <= cur_idx + 12))
     {
         parser.call(ctx, CB_FIN);
     }
@@ -223,6 +254,7 @@ int cb_hash_p1(struct CTXTYPE *ctx)
                         tmp_3w[3] = {0};
     uint32_t            len = data_end - data;
     uint8_t             *src_p, *dst_p, cur_step;
+    int                 limit;
 
     /* Check data_meta have room for meta_info struct */
     meta = (void *)(unsigned long)ctx->data_meta;
@@ -236,10 +268,19 @@ int cb_hash_p1(struct CTXTYPE *ctx)
     meta->cur_step += 1;
     cur_step = meta->cur_step;
 
+    limit = get_opt_limit();
+
+    if (get_opt(OP_DBG) > 0)
+    {
+        bpf_trace_printk("p%d lim  - %d" DBGLR, cur_step, limit);
+    }
+
     #pragma unroll
     for (int i =0; i <LOOP_MAX_ONE_ROUND; i++)
     {
-        if ((cur_idx + 12 > len) || (cur_idx >= LOOP_MAX_LEN)) //make verifier happy
+        if (  (cur_idx + 12 > len)
+            ||(cur_idx >= LOOP_MAX_LEN) //make verifier happy
+            ||(cur_idx + 12 > limit))
             break;
 
         data = (void*)(long)ctx->data;
@@ -269,18 +310,18 @@ int cb_hash_p1(struct CTXTYPE *ctx)
     meta->c = c;
     meta->cur_ofs  = cur_idx;
 
-    if (is_dbg_on_ex())
+    if (get_opt(OP_DBG) > 0)
     {
         bpf_trace_printk("p%d len  - %d" DBGLR, cur_step, len);
         bpf_trace_printk("p%d ofs  - %d" DBGLR, cur_step, cur_idx);
         bpf_trace_printk("p%d hash - %x" DBGLR, cur_step, meta->c);
     }
 
-    if (cur_idx == len)
+    if ((cur_idx == len) || (cur_idx == limit))
     {
         parser.call(ctx, CB_MATCH);
     }
-    else if (len <= cur_idx + 12)
+    else if ((len <= cur_idx + 12) || (limit <= cur_idx + 12))
     {
         parser.call(ctx, CB_FIN);
     }
@@ -324,7 +365,7 @@ int cb_hash_match(struct CTXTYPE *ctx)
 
         rc = XDP_DROP;
 
-        if (is_dbg_on_ex())
+        if (get_opt(OP_DBG) > 0)
         {
             bpf_trace_printk("drop hash - %x" DBGLR, meta->c);
         }
@@ -354,16 +395,28 @@ class PinnedArray(table.Array):
         self.Leaf = leaftype
         self.max_entries = max_entries
 
-def toggle_kdbg(kpath, is_en):
+def set_opt_val(kpath, in_opt_tbl, opt_idx, val):
+    opt_name = ["DBG", "HASH LEN"]
+
     try:
-        kdbg    = PinnedArray(kpath, ctypes.c_uint32, ctypes.c_uint32, 1)
-        kdbg[0] = ctypes.c_uint32([0, 1][is_en])
+        if kpath != None:
+            opt_tbl = PinnedArray(kpath, ctypes.c_uint32, ctypes.c_uint32, len(opt_name))
+        else:
+            opt_tbl = in_opt_tbl
+
+        opt_tbl[opt_idx] = ctypes.c_uint32(val)
 
     except:
-        print("Failed to toggle bpf debug flag !!!")
+        print("Failed to set option : {} !!!".format(opt_name[opt_idx]))
 
     else:
-        print("BPF debug flag is {}.".format(["disabled", "enabled"][is_en]))
+        print("{} option value is {}.".format(opt_name[opt_idx], val))
+
+def cfg_opt_tbl(kpath, bopt_tbl, args):
+    for idx, opt in enumerate ([args.KDBG, args.HLEN]):
+        if opt != None:
+            set_opt_val(kpath, bopt_tbl, idx, opt)
+
 
 parser = argparse.ArgumentParser(description='Used to discard duplicate packets.')
 parser.add_argument('-d', '--dbg', dest='DBG', type=int, default=0,
@@ -372,20 +425,25 @@ parser.add_argument('--kdbg', dest='KDBG', action='store_const', const=True,
                     help='enable bpf debug message')
 parser.add_argument('--no-kdbg', dest='KDBG', action='store_const', const=False,
                     help='disable bpf debug message')
+parser.add_argument('--len', dest='HLEN', type=int,
+                    help='max input stream length for hash method, default is no limit')
 parser.add_argument('dev', nargs ='?',
                     help='device (required if not used to toggle bpf debug message)')
 
 args = parser.parse_args()
 
-if args.KDBG == None:
+if args.KDBG == None and args.HLEN == None:
     if args.dev == None:
         print("error: the following arguments are required: dev")
         exit (1)
     else:
         device = args.dev
 else:
-    toggle_kdbg(dbg_path, args.KDBG)
-    exit(0)
+    if args.dev == None:
+        cfg_opt_tbl(dbg_path, None, args)
+        exit(0)
+    else:
+        device = args.dev
 
 if mode == BPF.XDP:
     ret = "XDP_DROP"
@@ -416,19 +474,20 @@ for fn_name in fn_ar:
     if fn_name == "cb_hash_p0":
         fn_ing = fn
 
-dbg_opt = b.get_table("dbg_opt")
+opt_tbl = b.get_table("opt_tbl")
+cfg_opt_tbl(None, opt_tbl, args)
 
 try:
     if os.path.exists(dbg_path):
         os.remove(dbg_path)
 
-    ret = libbcc.lib.bpf_obj_pin(dbg_opt.map_fd, ctypes.c_char_p(dbg_path.encode('utf-8')))
+    ret = libbcc.lib.bpf_obj_pin(opt_tbl.map_fd, ctypes.c_char_p(dbg_path.encode('utf-8')))
     if ret != 0:
         raise Exception("Failed to pin map !!!")
 
 except:
     if args.DBG == 0:
-        print("Debug flag in kernel can not be modified !!!")
+        print("Option value in kernel can not be modified !!!")
         print("Plz execute \"mount -t bpf none /sys/fs/bpf\" first !!!\n")
 
 if mode == BPF.XDP:
@@ -446,7 +505,7 @@ drop_total = b.get_table("drop_total")
 sleep_sec = 0.5  # in seconds
 
 if args.DBG != 0:
-    toggle_kdbg(dbg_path, True)
+    set_opt_val(None, opt_tbl, 0, True)
     print("Printing debug info,", end= " ")
     sleep_sec = 1
 

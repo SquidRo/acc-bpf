@@ -4,7 +4,7 @@
 
 from bcc import BPF
 from bcc import libbcc, table
-import pyroute2, time, sys, argparse, ctypes, os
+import pyroute2, time, sys, argparse, ctypes, os, pdb
 
 c_text = """
 #include <uapi/linux/bpf.h>
@@ -36,24 +36,31 @@ enum cb_idx {
     CB_MAX,
 };
 
+enum op_idx {
+    OP_DBG,
+    OP_VXLAN,
+    OP_GTP,
+    OP_MAX,
+};
+
 struct meta_info {
     uint8_t hdr_len[CB_MAX];
     uint8_t cur_ofs;
 } __attribute__((aligned(4)));
 
-BPF_ARRAY(dbg_opt, uint32_t, 1); // 0: off, 1: on
+BPF_ARRAY(opt_tbl, uint32_t, OP_MAX); // 0: off, 1: on
 BPF_ARRAY(rem_total, uint64_t, CN_MAX);
 BPF_PROG_ARRAY(parser, CB_MAX);
 
-static inline int is_dbg_on_ex(void)
+static inline int is_opt_on(uint32_t opt_idx)
 {
-    uint32_t *dbg_flag;
+    uint32_t *opt_flag;
 
-    dbg_flag = dbg_opt.lookup((uint32_t []) {0});
+    opt_flag = opt_tbl.lookup(&opt_idx);
 
-    if (dbg_flag)
+    if (opt_flag)
     {
-        return (*dbg_flag != 0);
+        return (*opt_flag != 0);
     }
 
     return 0;
@@ -142,10 +149,12 @@ static inline int dispatch_port(struct CTXTYPE *ctx, uint16_t port)
     switch (port)
     {
     case htons(4789):
-        parser.call(ctx, CB_VXLAN);
+        if (is_opt_on(OP_VXLAN))
+            parser.call(ctx, CB_VXLAN);
         break;
     case htons(GTP1U_PORT):
-        parser.call(ctx, CB_GTP);
+        if (is_opt_on(OP_GTP))
+            parser.call(ctx, CB_GTP);
         break;
     default:
         break;
@@ -161,6 +170,9 @@ int cb_eth(struct CTXTYPE *ctx)
     struct          meta_info *meta;
     struct ethhdr   *eth;
     int             ret;
+
+    if (! (is_opt_on(OP_VXLAN) || (is_opt_on(OP_GTP))))
+        return XDP_PASS;
 
     ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(*meta));
     if (ret < 0)
@@ -187,7 +199,7 @@ int cb_eth(struct CTXTYPE *ctx)
     meta->hdr_len[CB_ETH] = sizeof(*eth);
     meta->cur_ofs = sizeof(*eth);
 
-    if (is_dbg_on_ex())
+    if (is_opt_on(OP_DBG))
     {
         bpf_trace_printk("eth ofs - %d" DBGLR, meta->cur_ofs);
     }
@@ -237,7 +249,7 @@ int cb_vlan(struct CTXTYPE *ctx)
     meta->hdr_len[CB_VLAN] = len;
     meta->cur_ofs = cur_ofs + len;
 
-    if (is_dbg_on_ex())
+    if (is_opt_on(OP_DBG))
     {
         bpf_trace_printk("vlan ofs - %d" DBGLR, meta->cur_ofs);
     }
@@ -270,7 +282,7 @@ int cb_ip4(struct CTXTYPE *ctx)
     meta->hdr_len[CB_IP4] = iph->ihl << 2;
     meta->cur_ofs += iph->ihl << 2;
 
-    if (is_dbg_on_ex())
+    if (is_opt_on(OP_DBG))
     {
         bpf_trace_printk("ip4 ofs - %d" DBGLR, meta->cur_ofs);
     }
@@ -302,7 +314,7 @@ int cb_ip6(struct CTXTYPE *ctx)
     meta->hdr_len[CB_IP6] = sizeof(*ip6h);
     meta->cur_ofs += sizeof(*ip6h);
 
-    if (is_dbg_on_ex())
+    if (is_opt_on(OP_DBG))
     {
         bpf_trace_printk("ip6 ofs - %d" DBGLR, meta->cur_ofs);
     }
@@ -335,7 +347,7 @@ int cb_udp(struct CTXTYPE *ctx)
     meta->hdr_len[CB_UDP] = sizeof(*udph);
     meta->cur_ofs += sizeof(*udph);
 
-    if (is_dbg_on_ex())
+    if (is_opt_on(OP_DBG))
     {
         bpf_trace_printk("udp ofs - %d" DBGLR, meta->cur_ofs);
     }
@@ -368,7 +380,7 @@ int cb_tcp(struct CTXTYPE *ctx)
     meta->hdr_len[CB_TCP] = tcph->doff << 2;
     meta->cur_ofs += tcph->doff << 2;
 
-    if (is_dbg_on_ex())
+    if (is_opt_on(OP_DBG))
     {
         bpf_trace_printk("tcp ofs - %d" DBGLR,meta->cur_ofs);
     }
@@ -402,7 +414,7 @@ int cb_vxlan(struct CTXTYPE *ctx)
 
     meta->cur_ofs + sizeof(*vxlanh);
 
-    if (is_dbg_on_ex())
+    if (is_opt_on(OP_DBG))
     {
         bpf_trace_printk("vxlan ofs - %d" DBGLR, meta->cur_ofs);
     }
@@ -460,7 +472,7 @@ int cb_gtp(struct CTXTYPE *ctx)
     meta->cur_ofs += hdr_len;
     meta->hdr_len[CB_GTP] = hdr_len;
 
-    if (is_dbg_on_ex())
+    if (is_opt_on(OP_DBG))
     {
         bpf_trace_printk("gtp1u ofs - %d" DBGLR, meta->cur_ofs);
     }
@@ -554,16 +566,27 @@ class PinnedArray(table.Array):
         self.Leaf = leaftype
         self.max_entries = max_entries
 
-def toggle_kdbg(kpath, is_en):
+def set_opt_val(kpath, in_opt_tbl, opt_idx, val):
+    opt_name = ["KDBG", "VXLAN" , "GTP"]
+
     try:
-        kdbg    = PinnedArray(kpath, ctypes.c_uint32, ctypes.c_uint32, 1)
-        kdbg[0] = ctypes.c_uint32([0, 1][is_en])
+        if kpath != None:
+            opt_tbl = PinnedArray(kpath, ctypes.c_uint32, ctypes.c_uint32, len(opt_name))
+        else:
+            opt_tbl = in_opt_tbl
+
+        opt_tbl[opt_idx] = ctypes.c_uint32(val)
 
     except:
-        print("Failed to toggle bpf debug flag !!!")
+        print("Failed to set option : {} !!!".format(opt_name[opt_idx]))
 
     else:
-        print("BPF debug flag is {}.".format(["disabled", "enabled"][is_en]))
+        print("{} option is {}.".format(opt_name[opt_idx], ["disabled", "enabled"][val]))
+
+def cfg_opt_tbl(kpath, bopt_tbl, args):
+    for idx, opt in enumerate ([args.KDBG, args.VXLAN, args.GTP]):
+        if opt != None:
+            set_opt_val(kpath, bopt_tbl, idx, opt)
 
 def get_total(tbl):
     ret = 0
@@ -581,22 +604,40 @@ parser.add_argument('--kdbg', dest='KDBG', action='store_const', const=True,
                     help='enable bpf debug message')
 parser.add_argument('--no-kdbg', dest='KDBG', action='store_const', const=False,
                     help='disable bpf debug message')
+parser.add_argument('--vxlan', dest='VXLAN', action='store_const', const=True,
+                    help='enable removing VXLAN header')
+parser.add_argument('--no-vxlan', dest='VXLAN', action='store_const', const=False,
+                    help='disable removing VXLAN header')
+parser.add_argument('--gtp', dest='GTP', action='store_const', const=True,
+                    help='enable removing GTPv1-U header')
+parser.add_argument('--no-gtp', dest='GTP', action='store_const', const=False,
+                    help='disable removing GTPv1-U header')
 parser.add_argument('dev', nargs ='?',
                     help='device (required if not used to toggle bpf debug message)')
 
 args = parser.parse_args()
 
-if args.KDBG == None:
-    if args.dev == None:
+#pdb.set_trace()
+
+if args.dev == None:
+    if all(v is None for v in [args.KDBG, args.VXLAN, args.GTP]):
         print("error: the following arguments are required: dev")
         exit (1)
     else:
-        device = args.dev
-
+        cfg_opt_tbl(dbg_path, None, args)
+        exit(0)
 else:
-    toggle_kdbg(dbg_path, args.KDBG)
-    exit(0)
+    device = args.dev
 
+    # enable removing VXLAN/GTP header by default
+    if args.VXLAN == None:
+        args.VXLAN = True
+
+    if args.GTP == None:
+        args.GTP = True
+
+    if args.DBG != 0:
+        args.KDBG = True
 
 if mode == BPF.XDP:
     ret = "XDP_DROP"
@@ -606,7 +647,7 @@ else:
     ctxtype = "__sk_buff"
 
 # load BPF program
-b = BPF(text=c_text, 
+b = BPF(text=c_text,
         cflags=["-c", "-w", "-DKBUILD_MODNAME", '-DDBGLR="\\n"', "-DCTXTYPE=%s" % ctxtype ],
         device=offload_device, debug=args.DBG)
 
@@ -624,13 +665,14 @@ for fn_name in fn_ar:
     if fn_name == "cb_eth":
         fn_eth = fn
 
-dbg_opt = b.get_table("dbg_opt")
+opt_tbl = b.get_table("opt_tbl")
+cfg_opt_tbl(None, opt_tbl, args)
 
 try:
     if os.path.exists(dbg_path):
         os.remove(dbg_path)
 
-    ret = libbcc.lib.bpf_obj_pin(dbg_opt.map_fd, ctypes.c_char_p(dbg_path.encode('utf-8')))
+    ret = libbcc.lib.bpf_obj_pin(opt_tbl.map_fd, ctypes.c_char_p(dbg_path.encode('utf-8')))
     if ret != 0:
         raise Exception("Failed to pin map !!!")
 
@@ -653,7 +695,6 @@ rem_total = b.get_table("rem_total")
 sleep_sec = 10  # in seconds
 
 if args.DBG != 0:
-    toggle_kdbg(dbg_path, True)
     print("Printing debug info,", end= " ")
 
 print("hit CTRL+C to stop")
