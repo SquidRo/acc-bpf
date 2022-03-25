@@ -20,4 +20,4 @@ Steps to install acc-bpf on DUT
 |:---         |:---         |:---
 | xdp_cutPacket.py | Truncate packets | xdp_cutPacket.py --hosts 192.168.1.1 eth0 |
 | xdp_deDup.py | Discard duplicate Packets | xdp_deDup.py eth0 |
-| xdp_remTnlhdr.py | Remove GTPv1-U/Vxlan header | xdp_remTnlhdr.py eth0 |
+| xdp_remTnlhdr.py | Remove GTPv1-U/Vxlan/GRE header | xdp_remTnlhdr.py eth0 |

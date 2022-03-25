@@ -4,7 +4,7 @@
 
 from bcc import BPF
 from bcc import libbcc, table
-import pyroute2, time, sys, argparse, ctypes, os, pdb
+import pyroute2, time, sys, argparse, ctypes, os
 
 c_text = """
 #include <uapi/linux/bpf.h>
@@ -16,11 +16,13 @@ c_text = """
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/gtp.h>
+#include <net/gre.h>
 #include <bcc/proto.h>
 
 enum cn_idx {
     CN_VXLAN,
     CN_GTP,
+    CN_GRE,
     CN_MAX
 };
 
@@ -31,6 +33,7 @@ enum cb_idx {
     CB_IP6,
     CB_TCP,
     CB_UDP,
+    CB_GRE,
     CB_VXLAN,
     CB_GTP,
     CB_MAX,
@@ -40,6 +43,7 @@ enum op_idx {
     OP_DBG,
     OP_VXLAN,
     OP_GTP,
+    OP_GRE,
     OP_MAX,
 };
 
@@ -134,6 +138,10 @@ static inline int dispatch_ippro(struct CTXTYPE *ctx, uint16_t proto)
         break;
     case IPPROTO_TCP:
         parser.call(ctx, CB_TCP);
+        break;
+    case IPPROTO_GRE:
+        if (is_opt_on(OP_GRE))
+            parser.call(ctx, CB_GRE);
         break;
     default:
         break;
@@ -320,6 +328,109 @@ int cb_ip6(struct CTXTYPE *ctx)
     }
 
     dispatch_ippro(ctx, ip6h->nexthdr);
+
+    return XDP_PASS;
+}
+
+//refer to gre_parse_header in linux kernel
+int cb_gre(struct CTXTYPE *ctx)
+{
+    void                *data_end;
+    void                *data;
+    struct meta_info    *meta;
+    struct gre_base_hdr *greh;
+    int                 hdr_len;
+
+    data_end = (void*)(long)ctx->data_end;
+    data = (void*)(long)ctx->data;
+
+    /* Check data_meta have room for meta_info struct */
+    meta = (void *)(unsigned long)ctx->data_meta;
+    if ((void *)&meta[1] > data)
+        return XDP_PASS;
+
+    greh = data + meta->cur_ofs;
+
+    if ((void *)&greh[1] > data_end)
+        return XDP_PASS;
+
+    hdr_len = gre_calc_hlen(greh->flags);
+
+    meta->hdr_len[CB_GRE] = hdr_len;
+
+    meta->cur_ofs += hdr_len;
+
+    if (is_opt_on(OP_DBG))
+    {
+        bpf_trace_printk("gre ofs - %d" DBGLR, meta->cur_ofs);
+    }
+
+    {
+        int         cut_len, l2_hdr_len;
+        uint8_t     is_outer_ip4 = 0;
+        uint8_t     is_inner_ip4 = 0;
+
+        // need to cut inserted (ip/gre) part
+        //    cut_len max: 60 + 16
+        // l2_hdr_len max: 14 + 8
+        cut_len    = meta->hdr_len[CB_IP4] + meta->hdr_len[CB_IP6] +
+                     meta->hdr_len[CB_GRE];
+        l2_hdr_len = meta->hdr_len[CB_ETH] + meta->hdr_len[CB_VLAN];
+
+        is_outer_ip4 = (meta->hdr_len[CB_IP4] > 0);
+        is_inner_ip4 = (greh->protocol == htons(ETH_P_IP));
+
+        if (is_inner_ip4 != is_outer_ip4)
+        {
+            // need to modify the ethertype
+            l2_hdr_len -= 2;
+        }
+
+        // move eth + vlan headear forward to strip the gre tunnel header
+        #pragma unroll
+        for (int i=0; i <22; i++)
+        {
+            char *src, *dst;
+
+            if (i > l2_hdr_len)
+                break;
+
+            src = data + i;
+            if (&src[1] > data_end)
+                return XDP_PASS;
+
+            dst = data + i + (cut_len & 0xff); // make verifier happy
+            if (&dst[1] > data_end)
+                return XDP_PASS;
+
+            *dst = *src;
+        }
+
+        if (is_inner_ip4 != is_outer_ip4)
+        {
+            char *dst;
+
+            // need to modify the ethertype
+            dst = data + (l2_hdr_len & 0xff) + (cut_len & 0xff); // make verifier happy
+            if (&dst[2] > data_end)
+                return XDP_PASS;
+
+            if (!is_inner_ip4)
+            {
+                dst[0] = 0x86;
+                dst[1] = 0xdd;
+            }
+            else
+            {
+                dst[0] = 0x08;
+                dst[1] = 0x00;
+            }
+        }
+
+        bpf_xdp_adjust_head(ctx, cut_len);
+
+        update_rem_total(CN_GRE);
+    }
 
     return XDP_PASS;
 }
@@ -554,6 +665,7 @@ dbg_path        = '/sys/fs/bpf/dbg_' + os.path.basename(os.path.splitext(__file_
 flags           = 0
 offload_device  = None
 mode            = BPF.XDP
+tnl_protos      = ["vxlan", "gtp", "gre"]
 
 class PinnedArray(table.Array):
     def __init__(self, map_path, keytype, leaftype, max_entries):
@@ -567,7 +679,7 @@ class PinnedArray(table.Array):
         self.max_entries = max_entries
 
 def set_opt_val(kpath, in_opt_tbl, opt_idx, val):
-    opt_name = ["KDBG", "VXLAN" , "GTP"]
+    opt_name = ["KDBG", "VXLAN" , "GTP", "GRE"]
 
     try:
         if kpath != None:
@@ -584,7 +696,7 @@ def set_opt_val(kpath, in_opt_tbl, opt_idx, val):
         print("{} option is {}.".format(opt_name[opt_idx], ["disabled", "enabled"][val]))
 
 def cfg_opt_tbl(kpath, bopt_tbl, args):
-    for idx, opt in enumerate ([args.KDBG, args.VXLAN, args.GTP]):
+    for idx, opt in enumerate ([args.KDBG, args.VXLAN, args.GTP, args.GRE]):
         if opt != None:
             set_opt_val(kpath, bopt_tbl, idx, opt)
 
@@ -595,8 +707,23 @@ def get_total(tbl):
 
     return ret
 
+def arg_tmpl(is_en, name):
+    tmpl = {
+        "dest"  : name.upper(),
+        "action": 'store_const',
+        "const" : is_en,
+        "help"  : "{} {} function".format(["disable", "enable"][is_en], name.upper())
+    }
+
+    return tmpl
+
+def create_args_proto(args, proto_lst):
+    for arg in proto_lst:
+        args.add_argument(*("--{}".format(arg),), **(arg_tmpl(True, arg)))
+        args.add_argument(*("--no-{}".format(arg),), **(arg_tmpl(False, arg)))
+
 parser = argparse.ArgumentParser(
-            description='Used to remove the tunnel header (VXLAN/GTPv1-U) of mirrored packets.')
+            description='Used to remove the tunnel header (VXLAN/GTPv1-U/GRE) of mirrored packets.')
 
 parser.add_argument('-d', '--dbg', dest='DBG', type=int, default=0,
                     help='debug flag for bcc')
@@ -604,23 +731,16 @@ parser.add_argument('--kdbg', dest='KDBG', action='store_const', const=True,
                     help='enable bpf debug message')
 parser.add_argument('--no-kdbg', dest='KDBG', action='store_const', const=False,
                     help='disable bpf debug message')
-parser.add_argument('--vxlan', dest='VXLAN', action='store_const', const=True,
-                    help='enable removing VXLAN header')
-parser.add_argument('--no-vxlan', dest='VXLAN', action='store_const', const=False,
-                    help='disable removing VXLAN header')
-parser.add_argument('--gtp', dest='GTP', action='store_const', const=True,
-                    help='enable removing GTPv1-U header')
-parser.add_argument('--no-gtp', dest='GTP', action='store_const', const=False,
-                    help='disable removing GTPv1-U header')
+
 parser.add_argument('dev', nargs ='?',
                     help='device (required if not used to toggle bpf debug message)')
 
+create_args_proto(parser, tnl_protos)
+
 args = parser.parse_args()
 
-#pdb.set_trace()
-
 if args.dev == None:
-    if all(v is None for v in [args.KDBG, args.VXLAN, args.GTP]):
+    if all(v is None for v in [args.KDBG, args.VXLAN, args.GTP, args.GRE]):
         print("error: the following arguments are required: dev")
         exit (1)
     else:
@@ -629,12 +749,10 @@ if args.dev == None:
 else:
     device = args.dev
 
-    # enable removing VXLAN/GTP header by default
-    if args.VXLAN == None:
-        args.VXLAN = True
-
-    if args.GTP == None:
-        args.GTP = True
+    # enable removing VXLAN/GTP/GRE header by default
+    for opt in ["VXLAN", "GTP", "GRE"]:
+        if getattr(args, opt) == None:
+            setattr(args, opt, True)
 
     if args.DBG != 0:
         args.KDBG = True
@@ -652,7 +770,7 @@ b = BPF(text=c_text,
         device=offload_device, debug=args.DBG)
 
 fn_ar = ["cb_eth", "cb_vlan", "cb_ip4", "cb_ip6",
-         "cb_tcp", "cb_udp", "cb_vxlan", "cb_gtp"]
+         "cb_tcp", "cb_udp", "cb_gre", "cb_vxlan", "cb_gtp"]
 
 parser = b.get_table("parser")
 
