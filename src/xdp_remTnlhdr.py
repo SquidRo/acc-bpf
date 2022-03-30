@@ -17,25 +17,19 @@ c_text = """
 #include <net/ipv6.h>
 #include <net/gtp.h>
 #include <net/gre.h>
+#include <net/geneve.h>
 #include <bcc/proto.h>
 
 enum cn_idx {
     CN_VXLAN,
     CN_GTP,
     CN_GRE,
+    CN_GENEVE,
     CN_MAX
 };
 
 enum cb_idx {
-    CB_ETH,
-    CB_VLAN,
-    CB_IP4,
-    CB_IP6,
-    CB_TCP,
-    CB_UDP,
-    CB_GRE,
-    CB_VXLAN,
-    CB_GTP,
+    CB_FUN_LST,
     CB_MAX,
 };
 
@@ -44,12 +38,20 @@ enum op_idx {
     OP_VXLAN,
     OP_GTP,
     OP_GRE,
+    OP_GENEVE,
     OP_MAX,
 };
 
 struct meta_info {
     uint8_t hdr_len[CB_MAX];
     uint8_t cur_ofs;
+} __attribute__((aligned(4)));
+
+struct meta_info_cut {
+    uint16_t    hdr_len[2];     // 0 - l2 hdr len (including ether type), 1 - cut len
+    uint8_t     is_inner_ip4;   // to modify ethertype
+    uint8_t     is_outer_ip4;
+    uint8_t     cn_id;          // refer to cn_idx
 } __attribute__((aligned(4)));
 
 BPF_ARRAY(opt_tbl, uint32_t, OP_MAX); // 0: off, 1: on
@@ -163,6 +165,10 @@ static inline int dispatch_port(struct CTXTYPE *ctx, uint16_t port)
     case htons(GTP1U_PORT):
         if (is_opt_on(OP_GTP))
             parser.call(ctx, CB_GTP);
+        break;
+    case htons(GENEVE_UDP_PORT):
+        if (is_opt_on(OP_GENEVE))
+            parser.call(ctx, CB_GENEVE);
         break;
     default:
         break;
@@ -366,9 +372,10 @@ int cb_gre(struct CTXTYPE *ctx)
     }
 
     {
-        int         cut_len, l2_hdr_len;
-        uint8_t     is_outer_ip4 = 0;
-        uint8_t     is_inner_ip4 = 0;
+        int                     cut_len, l2_hdr_len;
+        uint8_t                 is_outer_ip4 = 0;
+        uint8_t                 is_inner_ip4 = 0;
+        struct meta_info_cut    *meta_cut;
 
         // need to cut inserted (ip/gre) part
         //    cut_len max: 60 + 16
@@ -380,56 +387,17 @@ int cb_gre(struct CTXTYPE *ctx)
         is_outer_ip4 = (meta->hdr_len[CB_IP4] > 0);
         is_inner_ip4 = (greh->protocol == htons(ETH_P_IP));
 
-        if (is_inner_ip4 != is_outer_ip4)
-        {
-            // need to modify the ethertype
-            l2_hdr_len -= 2;
-        }
+        meta_cut = (void *)(unsigned long)ctx->data_meta;
+        if ((void *)&meta_cut[1] > data)
+            return XDP_PASS;
 
-        // move eth + vlan headear forward to strip the gre tunnel header
-        #pragma unroll
-        for (int i=0; i <22; i++)
-        {
-            char *src, *dst;
+        meta_cut->hdr_len[0] = l2_hdr_len;
+        meta_cut->hdr_len[1] = cut_len;
+        meta_cut->is_outer_ip4 = is_outer_ip4;
+        meta_cut->is_inner_ip4 = is_inner_ip4;
+        meta_cut->cn_id = CN_GRE;
 
-            if (i > l2_hdr_len)
-                break;
-
-            src = data + i;
-            if (&src[1] > data_end)
-                return XDP_PASS;
-
-            dst = data + i + (cut_len & 0xff); // make verifier happy
-            if (&dst[1] > data_end)
-                return XDP_PASS;
-
-            *dst = *src;
-        }
-
-        if (is_inner_ip4 != is_outer_ip4)
-        {
-            char *dst;
-
-            // need to modify the ethertype
-            dst = data + (l2_hdr_len & 0xff) + (cut_len & 0xff); // make verifier happy
-            if (&dst[2] > data_end)
-                return XDP_PASS;
-
-            if (!is_inner_ip4)
-            {
-                dst[0] = 0x86;
-                dst[1] = 0xdd;
-            }
-            else
-            {
-                dst[0] = 0x08;
-                dst[1] = 0x00;
-            }
-        }
-
-        bpf_xdp_adjust_head(ctx, cut_len);
-
-        update_rem_total(CN_GRE);
+        parser.call(ctx, CB_CUT_1);
     }
 
     return XDP_PASS;
@@ -507,6 +475,7 @@ int cb_vxlan(struct CTXTYPE *ctx)
     void                *data;
     struct meta_info    *meta;
     struct vxlan_t      *vxlanh;
+    uint8_t             cut_len;
 
     data_end = (void*)(long)ctx->data_end;
     data = (void*)(long)ctx->data;
@@ -521,18 +490,25 @@ int cb_vxlan(struct CTXTYPE *ctx)
     if ((void *)&vxlanh[1] > data_end)
         return XDP_PASS;
 
-    meta->cur_ofs += sizeof(*vxlanh);
-
-    meta->cur_ofs + sizeof(*vxlanh);
+    cut_len = meta->cur_ofs + sizeof(*vxlanh);
 
     if (is_opt_on(OP_DBG))
     {
-        bpf_trace_printk("vxlan ofs - %d" DBGLR, meta->cur_ofs);
+        bpf_trace_printk("vxlan ofs - %d" DBGLR, cut_len);
     }
 
-    bpf_xdp_adjust_head(ctx, meta->cur_ofs);
+    {
+        struct meta_info_cut    *meta_cut;
 
-    update_rem_total(CN_VXLAN);
+        meta_cut = (void *)(unsigned long)ctx->data_meta;
+        if ((void *)&meta_cut[1] > data)
+            return XDP_PASS;
+
+        meta_cut->hdr_len[1] = cut_len;
+        meta_cut->cn_id = CN_VXLAN;
+
+        parser.call(ctx, CB_CUT_2);
+    }
 
     return XDP_PASS;
 }
@@ -589,9 +565,10 @@ int cb_gtp(struct CTXTYPE *ctx)
     }
 
     {
-        int         cut_len, l2_hdr_len;
-        uint8_t     is_outer_ip4 = 0;
-        uint8_t     is_inner_ip4 = 0;
+        int                     cut_len, l2_hdr_len;
+        uint8_t                 is_outer_ip4 = 0;
+        uint8_t                 is_inner_ip4 = 0;
+        struct meta_info_cut    *meta_cut;
 
         // need to cut inserted (ip/udp or tcp /gprs) part
         //    cut_len max: 60 + 60 + 12
@@ -601,10 +578,106 @@ int cb_gtp(struct CTXTYPE *ctx)
                      meta->hdr_len[CB_GTP];
         l2_hdr_len = meta->hdr_len[CB_ETH] + meta->hdr_len[CB_VLAN];
 
-        is_outer_ip4 = (meta->hdr_len[CB_IP4] > 0);
-        is_inner_ip4 = is_ip4_hdr(data, data_end, meta->cur_ofs);
+        meta_cut = (void *)(unsigned long)ctx->data_meta;
+        if ((void *)&meta_cut[1] > data)
+            return XDP_PASS;
 
-        if (is_inner_ip4 != is_outer_ip4)
+        meta_cut->hdr_len[0] = l2_hdr_len;
+        meta_cut->hdr_len[1] = cut_len;
+        meta_cut->is_outer_ip4 = is_outer_ip4;
+        meta_cut->is_inner_ip4 = is_inner_ip4;
+        meta_cut->cn_id = CN_GTP;
+
+        parser.call(ctx, CB_CUT_1);
+    }
+
+    return XDP_PASS;
+}
+
+int cb_geneve(struct CTXTYPE *ctx)
+{
+    void                *data_end;
+    void                *data;
+    struct meta_info    *meta;
+    //refer to geneve_udp_encap_recv in linux kernel
+    struct genevehdr    *geneveh;
+    uint8_t             cut_len;
+
+    data_end = (void*)(long)ctx->data_end;
+    data = (void*)(long)ctx->data;
+
+    /* Check data_meta have room for meta_info struct */
+    meta = (void *)(unsigned long)ctx->data_meta;
+    if ((void *)&meta[1] > data)
+        return XDP_PASS;
+
+    geneveh = data + meta->cur_ofs;
+
+    if ((void *)&geneveh[1] > data_end)
+        return XDP_PASS;
+
+    if (geneveh->proto_type != htons(ETH_P_TEB))
+        return XDP_PASS;
+
+    // maximum geneve header size : 260
+    cut_len = meta->cur_ofs + sizeof(*geneveh) + geneveh->opt_len * 4;
+
+    if (is_opt_on(OP_DBG))
+    {
+        bpf_trace_printk("geneve ofs - %d" DBGLR, cut_len);
+    }
+
+    {
+        struct meta_info_cut    *meta_cut;
+
+        meta_cut = (void *)(unsigned long)ctx->data_meta;
+        if ((void *)&meta_cut[1] > data)
+            return XDP_PASS;
+
+        meta_cut->hdr_len[1] = cut_len;
+        meta_cut->cn_id = CN_GENEVE;
+
+        parser.call(ctx, CB_CUT_2);
+    }
+
+    return XDP_PASS;
+}
+
+// remove inserted header in the middle
+int cb_cut_1(struct CTXTYPE *ctx)
+{
+    void                    *data_end;
+    void                    *data;
+    struct meta_info_cut    *meta;
+
+    data_end = (void*)(long)ctx->data_end;
+    data = (void*)(long)ctx->data;
+
+    /* Check data_meta have room for meta_info struct */
+    meta = (void *)(unsigned long)ctx->data_meta;
+    if ((void *)&meta[1] > data)
+        return XDP_PASS;
+
+    if (is_opt_on(OP_DBG))
+    {
+        bpf_trace_printk("cut1 hdr_len[0] - %d" DBGLR, meta->hdr_len[0]);
+        bpf_trace_printk("cut1 hdr_len[1] - %d" DBGLR, meta->hdr_len[1]);
+        bpf_trace_printk("cut1 is_inner_ip4 - %d" DBGLR, meta->is_inner_ip4);
+        bpf_trace_printk("cut1 is_outer_ip4 - %d" DBGLR, meta->is_outer_ip4);
+    }
+
+    {
+        int         cut_len, l2_hdr_len, cn_id;
+        uint8_t     is_outer_ip4 = 0;
+        uint8_t     is_inner_ip4 = 0;
+
+        // need to cut inserted part
+        // l2_hdr_len max: 14 + 8
+        cut_len    = meta->hdr_len[1];
+        l2_hdr_len = meta->hdr_len[0];
+        cn_id      = meta->cn_id;
+
+        if (meta->is_inner_ip4 != meta->is_outer_ip4)
         {
             // need to modify the ethertype
             l2_hdr_len -= 2;
@@ -630,7 +703,7 @@ int cb_gtp(struct CTXTYPE *ctx)
             *dst = *src;
         }
 
-        if (is_inner_ip4 != is_outer_ip4)
+        if (meta->is_inner_ip4 != meta->is_outer_ip4)
         {
             char *dst;
 
@@ -653,8 +726,38 @@ int cb_gtp(struct CTXTYPE *ctx)
 
         bpf_xdp_adjust_head(ctx, cut_len);
 
-        update_rem_total(CN_GTP);
+        update_rem_total(cn_id);
     }
+
+    return XDP_PASS;
+}
+
+//remove inserted header from head
+int cb_cut_2(struct CTXTYPE *ctx)
+{
+    void                    *data_end;
+    void                    *data;
+    struct meta_info_cut    *meta;
+    int                     cn_id;
+
+    data_end = (void*)(long)ctx->data_end;
+    data = (void*)(long)ctx->data;
+
+    /* Check data_meta have room for meta_info struct */
+    meta = (void *)(unsigned long)ctx->data_meta;
+    if ((void *)&meta[1] > data)
+        return XDP_PASS;
+
+    cn_id = meta->cn_id;
+
+    if (is_opt_on(OP_DBG))
+    {
+        bpf_trace_printk("cut2 ofs - %d" DBGLR, meta->hdr_len[1]);
+    }
+
+    bpf_xdp_adjust_head(ctx, meta->hdr_len[1]);
+
+    update_rem_total(cn_id);
 
     return XDP_PASS;
 }
@@ -665,7 +768,11 @@ dbg_path        = '/sys/fs/bpf/dbg_' + os.path.basename(os.path.splitext(__file_
 flags           = 0
 offload_device  = None
 mode            = BPF.XDP
-tnl_protos      = ["vxlan", "gtp", "gre"]
+tnl_protos      = ["vxlan", "gtp", "gre", "geneve"]
+opt_name        = ["KDBG"] + [ v.upper() for v in tnl_protos ]
+cb_fun_lst      = ["cb_eth", "cb_vlan", "cb_ip4", "cb_ip6", "cb_tcp", "cb_udp",
+                   "cb_gre", "cb_vxlan", "cb_gtp", "cb_geneve", "cb_cut_1", "cb_cut_2"]
+
 
 class PinnedArray(table.Array):
     def __init__(self, map_path, keytype, leaftype, max_entries):
@@ -679,8 +786,6 @@ class PinnedArray(table.Array):
         self.max_entries = max_entries
 
 def set_opt_val(kpath, in_opt_tbl, opt_idx, val):
-    opt_name = ["KDBG", "VXLAN" , "GTP", "GRE"]
-
     try:
         if kpath != None:
             opt_tbl = PinnedArray(kpath, ctypes.c_uint32, ctypes.c_uint32, len(opt_name))
@@ -696,9 +801,10 @@ def set_opt_val(kpath, in_opt_tbl, opt_idx, val):
         print("{} option is {}.".format(opt_name[opt_idx], ["disabled", "enabled"][val]))
 
 def cfg_opt_tbl(kpath, bopt_tbl, args):
-    for idx, opt in enumerate ([args.KDBG, args.VXLAN, args.GTP, args.GRE]):
-        if opt != None:
-            set_opt_val(kpath, bopt_tbl, idx, opt)
+    for idx, opt in enumerate (opt_name):
+        tmp_opt = getattr(args, opt)
+        if tmp_opt != None:
+            set_opt_val(kpath, bopt_tbl, idx, tmp_opt)
 
 def get_total(tbl):
     ret = 0
@@ -740,7 +846,7 @@ create_args_proto(parser, tnl_protos)
 args = parser.parse_args()
 
 if args.dev == None:
-    if all(v is None for v in [args.KDBG, args.VXLAN, args.GTP, args.GRE]):
+    if all(getattr(args, v) is None for v in opt_name):
         print("error: the following arguments are required: dev")
         exit (1)
     else:
@@ -749,10 +855,10 @@ if args.dev == None:
 else:
     device = args.dev
 
-    # enable removing VXLAN/GTP/GRE header by default
-    for opt in ["VXLAN", "GTP", "GRE"]:
-        if getattr(args, opt) == None:
-            setattr(args, opt, True)
+    # enable removing all tunnel header by default
+    for opt in tnl_protos:
+        if getattr(args, opt.upper()) == None:
+            setattr(args, opt.upper(), True)
 
     if args.DBG != 0:
         args.KDBG = True
@@ -766,19 +872,16 @@ else:
 
 # load BPF program
 b = BPF(text=c_text,
-        cflags=["-c", "-w", "-DKBUILD_MODNAME", '-DDBGLR="\\n"', "-DCTXTYPE=%s" % ctxtype ],
+        cflags=["-c", "-w", "-DKBUILD_MODNAME", '-DDBGLR="\\n"', "-DCTXTYPE=%s" % ctxtype,
+                "-DCB_FUN_LST=%s" % ",".join([v.upper() for v in cb_fun_lst ])
+        ],
         device=offload_device, debug=args.DBG)
-
-fn_ar = ["cb_eth", "cb_vlan", "cb_ip4", "cb_ip6",
-         "cb_tcp", "cb_udp", "cb_gre", "cb_vxlan", "cb_gtp"]
 
 parser = b.get_table("parser")
 
-cb_idx = 0
-for fn_name in fn_ar:
+for cb_idx, fn_name in enumerate (cb_fun_lst):
     fn = b.load_func(fn_name, mode, offload_device)
     parser[ctypes.c_int(cb_idx)] = ctypes.c_int(fn.fd)
-    cb_idx += 1
 
     if fn_name == "cb_eth":
         fn_eth = fn
